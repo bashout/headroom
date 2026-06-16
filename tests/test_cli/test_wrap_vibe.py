@@ -276,9 +276,252 @@ def test_wrap_vibe_no_context_tool(
     with patch.object(wrap_mod.shutil, "which", return_value="vibe"):
         with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
             with patch.object(wrap_mod, "_project_name_from_cwd", return_value=None):
-                # Test --no-rtk
-                result = runner.invoke(main, ["wrap", "vibe", "--no-rtk", "--", "test"])
+                # Test --no-rtk - should skip RTK setup
+                with patch.object(wrap_mod, "_setup_vibe_rtk") as mock_setup:
+                    result = runner.invoke(main, ["wrap", "vibe", "--no-rtk", "--", "test"])
+                    mock_setup.assert_not_called()
 
     assert result.exit_code == 0, result.output
     assert captured["args"] == ("test",)
     assert "--no-rtk" not in captured["args"]
+
+
+def test_wrap_vibe_rtk_setup_called(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RTK setup is called when --no-rtk is not specified."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+
+    captured: dict[str, Any] = {}
+
+    def fake_launch_tool(**kwargs: Any) -> None:  # noqa: ANN003
+        captured.update(kwargs)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="vibe"):
+        with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
+            with patch.object(wrap_mod, "_project_name_from_cwd", return_value=None):
+                with patch.object(wrap_mod, "_setup_vibe_rtk") as mock_setup:
+                    result = runner.invoke(main, ["wrap", "vibe", "--", "test"])
+
+    assert result.exit_code == 0, result.output
+    mock_setup.assert_called_once()
+
+
+def test_wrap_vibe_rtk_injection(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RTK instructions are injected into AGENTS.md."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+
+    # Create a temporary home directory for vibe
+    vibe_home = tmp_path / ".vibe"
+    vibe_home.mkdir()
+    agents_file = vibe_home / "AGENTS.md"
+
+    with patch.object(wrap_mod.shutil, "which", return_value="vibe"):
+        with patch.object(
+            wrap_mod, "_get_vibe_agents_md_path", return_value=agents_file
+        ):
+            with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=tmp_path / "rtk"):
+                with patch.object(wrap_mod, "_launch_tool"):
+                    with patch.object(wrap_mod, "_project_name_from_cwd", return_value=None):
+                        result = runner.invoke(main, ["wrap", "vibe", "--", "test"])
+
+    assert result.exit_code == 0, result.output
+    assert agents_file.exists()
+    content = agents_file.read_text()
+    assert "<!-- headroom:rtk-instructions -->" in content
+    assert "rtk git status" in content
+
+
+def test_wrap_vibe_rtk_injection_skipped_with_no_rtk(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RTK instructions are NOT injected when --no-rtk is specified."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+
+    # Create a temporary home directory for vibe
+    vibe_home = tmp_path / ".vibe"
+    vibe_home.mkdir()
+    agents_file = vibe_home / "AGENTS.md"
+    # Pre-create the file
+    agents_file.write_text("# Existing content\n")
+
+    with patch.object(wrap_mod.shutil, "which", return_value="vibe"):
+        with patch.object(
+            wrap_mod, "_get_vibe_agents_md_path", return_value=agents_file
+        ):
+            with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=tmp_path / "rtk"):
+                with patch.object(wrap_mod, "_launch_tool"):
+                    with patch.object(wrap_mod, "_project_name_from_cwd", return_value=None):
+                        result = runner.invoke(main, ["wrap", "vibe", "--no-rtk", "--", "test"])
+
+    assert result.exit_code == 0, result.output
+    # The file should not have RTK instructions added
+    content = agents_file.read_text()
+    assert "<!-- headroom:rtk-instructions -->" not in content
+    assert content == "# Existing content\n"
+
+
+def test_wrap_vibe_prepare_only_with_rtk(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--prepare-only with default settings calls RTK setup."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+
+    vibe_home = tmp_path / ".vibe"
+    vibe_home.mkdir()
+    agents_file = vibe_home / "AGENTS.md"
+
+    with patch.object(
+        wrap_mod, "_get_vibe_agents_md_path", return_value=agents_file
+    ):
+        with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=tmp_path / "rtk"):
+            result = runner.invoke(main, ["wrap", "vibe", "--prepare-only"])
+
+    assert result.exit_code == 0, result.output
+    assert agents_file.exists()
+    content = agents_file.read_text()
+    assert "<!-- headroom:rtk-instructions -->" in content
+
+
+def test_wrap_vibe_prepare_only_with_no_rtk(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--prepare-only with --no-rtk does not call RTK setup."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+
+    with patch.object(wrap_mod, "_setup_vibe_rtk") as mock_setup:
+        result = runner.invoke(main, ["wrap", "vibe", "--prepare-only", "--no-rtk"])
+
+    assert result.exit_code == 0, result.output
+    mock_setup.assert_not_called()
+
+
+# =============================================================================
+# Unwrap Vibe Tests
+# =============================================================================
+
+
+def test_unwrap_vibe_removes_rtk_instructions(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unwrap vibe removes RTK instructions from AGENTS.md."""
+    vibe_home = tmp_path / ".vibe"
+    vibe_home.mkdir()
+    agents_file = vibe_home / "AGENTS.md"
+
+    # Create AGENTS.md with RTK instructions
+    rtk_block = "<!-- headroom:rtk-instructions -->\n# RTK\nrtk git status\n<!-- /headroom:rtk-instructions -->"
+    agents_file.write_text(f"# Some content\n\n{rtk_block}\n\n# More content\n")
+
+    with patch.object(wrap_mod, "_get_vibe_agents_md_path", return_value=agents_file):
+        with patch.object(
+            wrap_mod, "_stop_local_proxy_for_unwrap", return_value="stopped"
+        ):
+            result = runner.invoke(main, ["unwrap", "vibe", "--port", "9999"])
+
+    assert result.exit_code == 0, result.output
+    assert "Removed rtk instructions from" in result.output
+
+    # Verify the RTK block was removed but other content remains
+    content = agents_file.read_text()
+    assert "<!-- headroom:rtk-instructions -->" not in content
+    assert "<!-- /headroom:rtk-instructions -->" not in content
+    assert "# Some content" in content
+    assert "# More content" in content
+
+
+def test_unwrap_vibe_keeps_rtk_with_keep_flag(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unwrap vibe with --keep-rtk does not remove RTK instructions."""
+    vibe_home = tmp_path / ".vibe"
+    vibe_home.mkdir()
+    agents_file = vibe_home / "AGENTS.md"
+
+    # Create AGENTS.md with RTK instructions
+    rtk_block = "<!-- headroom:rtk-instructions -->\n# RTK\nrtk git status\n<!-- /headroom:rtk-instructions -->"
+    agents_file.write_text(f"# Some content\n\n{rtk_block}\n")
+
+    with patch.object(wrap_mod, "_get_vibe_agents_md_path", return_value=agents_file):
+        with patch.object(
+            wrap_mod, "_stop_local_proxy_for_unwrap", return_value="stopped"
+        ):
+            result = runner.invoke(main, ["unwrap", "vibe", "--port", "9999", "--keep-rtk"])
+
+    assert result.exit_code == 0, result.output
+    assert "Kept rtk instructions in AGENTS.md" in result.output
+
+    # Verify the RTK block was NOT removed
+    content = agents_file.read_text()
+    assert "<!-- headroom:rtk-instructions -->" in content
+
+
+def test_unwrap_vibe_no_rtk_instructions_found(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unwrap vibe reports when no RTK instructions are found."""
+    vibe_home = tmp_path / ".vibe"
+    vibe_home.mkdir()
+    agents_file = vibe_home / "AGENTS.md"
+
+    # Create AGENTS.md without RTK instructions
+    agents_file.write_text("# Some content\n")
+
+    with patch.object(wrap_mod, "_get_vibe_agents_md_path", return_value=agents_file):
+        with patch.object(
+            wrap_mod, "_stop_local_proxy_for_unwrap", return_value="stopped"
+        ):
+            result = runner.invoke(main, ["unwrap", "vibe", "--port", "9999"])
+
+    assert result.exit_code == 0, result.output
+    assert "No rtk instructions found in" in result.output
+
+
+def test_unwrap_vibe_no_stop_proxy(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unwrap vibe with --no-stop-proxy does not stop the proxy."""
+    vibe_home = tmp_path / ".vibe"
+    vibe_home.mkdir()
+    agents_file = vibe_home / "AGENTS.md"
+
+    # Create AGENTS.md with RTK instructions
+    rtk_block = "<!-- headroom:rtk-instructions -->\n# RTK\n<!-- /headroom:rtk-instructions -->"
+    agents_file.write_text(rtk_block)
+
+    with patch.object(wrap_mod, "_get_vibe_agents_md_path", return_value=agents_file):
+        with patch.object(
+            wrap_mod, "_stop_local_proxy_for_unwrap", return_value="stopped"
+        ) as mock_stop:
+            result = runner.invoke(
+                main, ["unwrap", "vibe", "--port", "9999", "--no-stop-proxy"]
+            )
+
+    assert result.exit_code == 0, result.output
+    mock_stop.assert_not_called()
+    assert "Stopped local Headroom proxy" not in result.output

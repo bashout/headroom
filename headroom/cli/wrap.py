@@ -1464,6 +1464,79 @@ def _inject_rtk_instructions(file_path: Path, verbose: bool = False) -> bool:
     return True
 
 
+def _get_vibe_agents_md_path() -> Path:
+    """Get the path to Mistral Vibe's AGENTS.md file.
+
+    Vibe loads AGENTS.md from:
+    1. User-level: $VIBE_HOME/AGENTS.md (or ~/.vibe/AGENTS.md if VIBE_HOME not set)
+    2. Project-level: the first AGENTS.md found walking up from cwd (within trusted folders)
+
+    For Headroom wrap, we use the user-level path to ensure instructions persist
+    across projects. Creates parent directory if needed.
+    """
+    vibe_home = os.environ.get("VIBE_HOME")
+    if vibe_home:
+        base_dir = Path(vibe_home).expanduser()
+    else:
+        base_dir = Path.home() / ".vibe"
+
+    agents_file = base_dir / "AGENTS.md"
+    return agents_file
+
+
+def _setup_vibe_rtk(verbose: bool = False) -> Path | None:
+    """Ensure rtk is installed and instructions are injected for Mistral Vibe.
+
+    Injects RTK instructions into ~/.vibe/AGENTS.md (or $VIBE_HOME/AGENTS.md).
+    Returns the rtk path if successful, None otherwise.
+    """
+    rtk_path = _ensure_rtk_binary(verbose=verbose)
+    if not rtk_path:
+        return None
+
+    agents_file = _get_vibe_agents_md_path()
+    _inject_rtk_instructions(agents_file, verbose=verbose)
+    return rtk_path
+
+
+def _strip_rtk_instructions_from_file(file_path: Path) -> bool:
+    """Remove RTK instructions block from a file.
+
+    Removes everything between ``<!-- headroom:rtk-instructions -->`` and
+    ``<!-- /headroom:rtk-instructions -->`` (inclusive).
+    Returns True if the block was found and removed.
+    """
+    if not file_path.exists():
+        return False
+
+    content = file_path.read_text()
+    start_marker = _RTK_MARKER
+    end_marker = "<!-- /headroom:rtk-instructions -->"
+
+    start_idx = content.find(start_marker)
+    if start_idx == -1:
+        return False
+
+    end_idx = content.find(end_marker, start_idx)
+    if end_idx == -1:
+        return False
+
+    # Remove the block (inclusive of both markers)
+    new_content = content[:start_idx] + content[end_idx + len(end_marker):]
+
+    # Clean up any double newlines
+    new_content = new_content.replace("\n\n\n", "\n\n")
+    new_content = new_content.strip()
+
+    if new_content:
+        file_path.write_text(new_content)
+    else:
+        # If file is now empty, remove it
+        file_path.unlink()
+
+    return True
+
+
 def _inject_memory_mcp_config(db_path: str, user_id: str) -> None:
     """Register headroom memory as an MCP server in Codex's config.toml.
 
@@ -3633,7 +3706,7 @@ def aider(
     "--no-rtk",
     "no_rtk",
     is_flag=True,
-    help="Skip CLI context-tool setup (no effect for vibe)",
+    help="Skip CLI context-tool setup",
 )
 @click.option(
     "--code-graph",
@@ -3661,6 +3734,8 @@ def vibe(
 
     \b
     Sets VIBE_PROVIDERS to route all Mistral API calls through Headroom.
+    Also installs rtk (Rust Token Killer) and injects token-optimized
+    command guidance into ~/.vibe/AGENTS.md (or $VIBE_HOME/AGENTS.md).
 
     \b
     Examples:
@@ -3670,6 +3745,9 @@ def vibe(
         headroom wrap vibe --no-context-tool       # Skip CLI context-tool setup
     """
     if prepare_only:
+        if not no_rtk:
+            click.echo("  Setting up rtk for Vibe...")
+            _setup_vibe_rtk(verbose=verbose)
         return
 
     vibe_bin = shutil.which("vibe")
@@ -3677,6 +3755,13 @@ def vibe(
         click.echo("Error: 'vibe' not found in PATH.")
         click.echo("Install Mistral Vibe: https://github.com/mistralai/mistral-vibe")
         raise SystemExit(1)
+
+    # Setup rtk before launching
+    if not no_rtk:
+        click.echo("  Setting up rtk for Vibe...")
+        _setup_vibe_rtk(verbose=verbose)
+    elif verbose:
+        click.echo("  Skipping CLI context tool (--no-context-tool)")
 
     env, env_vars_display = _build_mistral_vibe_launch_env(
         port, os.environ, project=_project_name_from_cwd()
@@ -3696,6 +3781,43 @@ def vibe(
         code_graph=code_graph,
         openai_api_url="https://api.mistral.ai",
     )
+
+
+# =============================================================================
+# Mistral Vibe (unwrap)
+# =============================================================================
+
+
+@unwrap.command("vibe")
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
+@click.option("--keep-rtk", is_flag=True, help="Keep rtk instructions in AGENTS.md")
+def unwrap_vibe(
+    port: int,
+    no_stop_proxy: bool,
+    keep_rtk: bool,
+) -> None:
+    """Undo durable setup from ``headroom wrap vibe``."""
+    click.echo()
+    click.echo("  ╔═══════════════════════════════════════════════╗")
+    click.echo("  ║           HEADROOM UNWRAP: VIBE               ║")
+    click.echo("  ╚═══════════════════════════════════════════════╝")
+    click.echo()
+
+    if not keep_rtk:
+        agents_file = _get_vibe_agents_md_path()
+        if _strip_rtk_instructions_from_file(agents_file):
+            click.echo(f"  Removed rtk instructions from {agents_file}")
+        else:
+            click.echo(f"  No rtk instructions found in {agents_file}")
+    else:
+        click.echo("  Kept rtk instructions in AGENTS.md (--keep-rtk).")
+
+    click.echo()
+    click.echo("✓ Vibe is no longer durably wrapped by Headroom.")
+    if not no_stop_proxy:
+        _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
+    click.echo()
 
 
 # =============================================================================
